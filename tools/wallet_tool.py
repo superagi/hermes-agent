@@ -4,6 +4,22 @@ These are the tools the LLM can call.  They go through the wallet manager
 and policy engine — the agent never has access to private keys.
 
 All handlers return JSON strings per Hermes convention.
+
+Toolset: ``wallet`` (optional install: ``pip install 'hermes-agent[wallet]'``)
+
+The toolset is gated on:
+  1. keystore + wallet packages being installed
+  2. The keystore being initialized and unlocked
+  3. At least one wallet existing
+
+Tools:
+  wallet_list         — List wallets with addresses and balances
+  wallet_balance      — Check balance of a specific wallet
+  wallet_send         — Send native tokens (policy-gated)
+  wallet_history      — Transaction history
+  wallet_estimate_gas — Fee estimation
+  wallet_address      — Get a wallet's deposit address (for sharing/receiving)
+  wallet_networks     — List supported and active blockchain networks
 """
 
 import json
@@ -38,7 +54,7 @@ def _get_manager():
         _wallet_manager = WalletManager(ks)
         _policy_engine = PolicyEngine()
 
-        # Register available chain providers
+        # Register available chain providers, respecting config.yaml overrides
         _register_providers(_wallet_manager)
 
         return _wallet_manager, _policy_engine
@@ -49,19 +65,33 @@ def _get_manager():
         return None, None
 
 
+def _load_rpc_overrides() -> dict:
+    """Load user RPC endpoint overrides from config.yaml."""
+    try:
+        from hermes_cli.config import load_config
+        cfg = load_config()
+        return cfg.get("wallet", {}).get("rpc_endpoints", {})
+    except Exception:
+        return {}
+
+
 def _register_providers(mgr):
-    """Register chain providers based on installed deps."""
+    """Register chain providers based on installed deps + config overrides."""
+    overrides = _load_rpc_overrides()
+
     try:
         from wallet.chains.evm import EVMProvider, EVM_CHAINS
         for chain_id, config in EVM_CHAINS.items():
-            mgr.register_provider(chain_id, EVMProvider(config))
+            rpc = overrides.get(chain_id, "")
+            mgr.register_provider(chain_id, EVMProvider(config, rpc_url_override=rpc))
     except ImportError:
         pass
 
     try:
         from wallet.chains.solana import SolanaProvider, SOLANA_CHAINS
         for chain_id, config in SOLANA_CHAINS.items():
-            mgr.register_provider(chain_id, SolanaProvider(config))
+            rpc = overrides.get(chain_id, "")
+            mgr.register_provider(chain_id, SolanaProvider(config, rpc_url_override=rpc))
     except ImportError:
         pass
 
@@ -290,6 +320,72 @@ def wallet_estimate_gas(args: dict, task_id: str = None, **kw) -> str:
         return json.dumps({"error": str(e)})
 
 
+def wallet_address(args: dict, task_id: str = None, **kw) -> str:
+    """Get a wallet's deposit address — for sharing with others or receiving funds."""
+    mgr, _ = _get_manager()
+    if mgr is None:
+        return json.dumps({"error": "Wallet not available"})
+
+    wallet_id = args.get("wallet_id")
+    chain = args.get("chain")
+
+    try:
+        wallet = mgr.resolve_wallet(wallet_id=wallet_id, chain=chain)
+        provider = mgr.get_provider(wallet.chain)
+        return json.dumps({
+            "wallet": wallet.label,
+            "wallet_id": wallet.wallet_id,
+            "chain": wallet.chain,
+            "network": provider.config.display_name,
+            "address": wallet.address,
+            "type": wallet.wallet_type,
+            "is_testnet": provider.config.is_testnet,
+            "message": (
+                f"Address for {wallet.label} on {provider.config.display_name}: "
+                f"{wallet.address}"
+            ),
+        })
+    except Exception as e:
+        return json.dumps({"error": str(e)})
+
+
+def wallet_networks(args: dict = None, task_id: str = None, **kw) -> str:
+    """List supported blockchain networks and which have active wallets."""
+    mgr, _ = _get_manager()
+    if mgr is None:
+        return json.dumps({"error": "Wallet not available"})
+
+    wallets = mgr.list_wallets()
+    wallet_chains = {w.chain for w in wallets}
+
+    networks = []
+    for chain_id in mgr.supported_chains:
+        try:
+            provider = mgr.get_provider(chain_id)
+            cfg = provider.config
+            networks.append({
+                "chain_id": chain_id,
+                "name": cfg.display_name,
+                "symbol": cfg.symbol,
+                "is_testnet": cfg.is_testnet,
+                "has_wallet": chain_id in wallet_chains,
+                "rpc_url": cfg.rpc_url,
+            })
+        except Exception:
+            networks.append({"chain_id": chain_id, "status": "error"})
+
+    # Group by mainnet/testnet for readability
+    mainnets = [n for n in networks if not n.get("is_testnet")]
+    testnets = [n for n in networks if n.get("is_testnet")]
+
+    return json.dumps({
+        "mainnets": mainnets,
+        "testnets": testnets,
+        "total_networks": len(networks),
+        "networks_with_wallets": len(wallet_chains),
+    })
+
+
 # =========================================================================
 # Tool registration
 # =========================================================================
@@ -420,4 +516,50 @@ registry.register(
     handler=lambda args, **kw: wallet_estimate_gas(args, **kw),
     check_fn=_check_wallet_available,
     emoji="⛽",
+)
+
+registry.register(
+    name="wallet_address",
+    toolset="wallet",
+    schema={
+        "name": "wallet_address",
+        "description": (
+            "Get a wallet's deposit address for receiving funds. "
+            "Use this to share your wallet address with others or to check "
+            "which address to send funds to."
+        ),
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "wallet_id": {
+                    "type": "string",
+                    "description": "Wallet ID (optional — uses default if only one wallet exists)",
+                },
+                "chain": {
+                    "type": "string",
+                    "description": "Chain name (e.g. 'solana', 'ethereum', 'base')",
+                },
+            },
+            "required": [],
+        },
+    },
+    handler=lambda args, **kw: wallet_address(args, **kw),
+    check_fn=_check_wallet_available,
+    emoji="📬",
+)
+
+registry.register(
+    name="wallet_networks",
+    toolset="wallet",
+    schema={
+        "name": "wallet_networks",
+        "description": (
+            "List all supported blockchain networks and which ones have active wallets. "
+            "Shows mainnets and testnets separately with their native token symbols."
+        ),
+        "parameters": {"type": "object", "properties": {}, "required": []},
+    },
+    handler=lambda args, **kw: wallet_networks(**kw),
+    check_fn=_check_wallet_available,
+    emoji="🌐",
 )
