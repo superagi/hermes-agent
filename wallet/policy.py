@@ -18,6 +18,8 @@ from enum import Enum
 from pathlib import Path
 from typing import Dict, List, Optional
 
+from wallet.file_state import read_json, update_json
+
 logger = logging.getLogger(__name__)
 
 
@@ -188,6 +190,8 @@ class PolicyEngine:
 
         Returns PolicyResult with the final verdict.
         """
+        # Refresh persisted state so multiple processes share freeze/rate/daily/cooldown.
+        self._load_state()
         if self._frozen:
             return PolicyResult(
                 verdict=PolicyVerdict.BLOCK,
@@ -203,7 +207,6 @@ class PolicyEngine:
 
         checked = []
 
-        # Check each policy
         _CHECKS = {
             "spending_limit": lambda cfg: _check_spending_limit(tx, cfg),
             "daily_limit": lambda cfg: _check_daily_limit(tx, cfg, self._daily_totals),
@@ -214,7 +217,14 @@ class PolicyEngine:
             "require_approval": lambda cfg: _check_require_approval(tx, cfg),
         }
 
-        for policy_name, config in policies.items():
+        # Hard blocks always run before approval policies.
+        policy_names = [p for p in policies.keys() if p != "require_approval"]
+        if "require_approval" in policies:
+            policy_names.append("require_approval")
+
+        pending_approval = None
+        for policy_name in policy_names:
+            config = policies[policy_name]
             check_fn = _CHECKS.get(policy_name)
             if not check_fn:
                 continue
@@ -228,13 +238,17 @@ class PolicyEngine:
                     failed=policy_name,
                 )
             elif result == PolicyVerdict.REQUIRE_APPROVAL:
-                return PolicyResult(
+                pending_approval = PolicyResult(
                     verdict=PolicyVerdict.REQUIRE_APPROVAL,
                     reason=f"Requires approval ({policy_name} policy)",
-                    checked=checked,
+                    checked=checked.copy(),
                     failed=policy_name,
                 )
-            checked.append(policy_name)
+            else:
+                checked.append(policy_name)
+
+        if pending_approval is not None:
+            return pending_approval
 
         return PolicyResult(
             verdict=PolicyVerdict.ALLOW,
@@ -243,19 +257,45 @@ class PolicyEngine:
         )
 
     def record_transaction(self, tx: TxRequest) -> None:
-        """Update tracking state after a successful transaction."""
-        today_key = f"{tx.wallet_id}:{time.strftime('%Y-%m-%d')}"
-        self._daily_totals[today_key] += tx.amount
+        """Update tracking state after a successful transaction.
 
-        self._tx_timestamps[tx.wallet_id].append(time.time())
-        self._last_tx_time[tx.wallet_id] = time.time()
-        self._save_state()
+        Uses locked read-modify-write so updates from separate processes merge
+        instead of clobbering each other.
+        """
+        now = time.time()
+        today_key = f"{tx.wallet_id}:{time.strftime('%Y-%m-%d')}"
+
+        def _merge(existing):
+            existing = existing or {}
+            daily = dict(existing.get("daily_totals", {}) or {})
+            prev = Decimal(str(daily.get(today_key, "0")))
+            daily[today_key] = str(prev + tx.amount)
+
+            timestamps = dict(existing.get("tx_timestamps", {}) or {})
+            vals = list(timestamps.get(tx.wallet_id, []) or [])
+            vals = [t for t in vals if now - t < 86400]
+            vals.append(now)
+            timestamps[tx.wallet_id] = vals
+
+            last = dict(existing.get("last_tx_time", {}) or {})
+            last[tx.wallet_id] = now
+
+            return {
+                "frozen": bool(existing.get("frozen", self._frozen)),
+                "daily_totals": daily,
+                "tx_timestamps": timestamps,
+                "last_tx_time": last,
+            }
+
+        new_state = update_json(self._state_path, {}, _merge)
+        self._frozen = bool(new_state.get("frozen", False))
+        self._daily_totals = defaultdict(Decimal, {k: Decimal(str(v)) for k, v in new_state.get("daily_totals", {}).items()})
+        self._tx_timestamps = defaultdict(list, new_state.get("tx_timestamps", {}) or {})
+        self._last_tx_time = new_state.get("last_tx_time", {}) or {}
 
     def _load_state(self) -> None:
         try:
-            if not self._state_path.exists():
-                return
-            data = json.loads(self._state_path.read_text())
+            data = read_json(self._state_path, {})
             self._frozen = bool(data.get("frozen", False))
             self._daily_totals = defaultdict(
                 Decimal,
@@ -268,14 +308,21 @@ class PolicyEngine:
 
     def _save_state(self) -> None:
         try:
-            payload = {
-                "frozen": self._frozen,
-                "daily_totals": {k: str(v) for k, v in self._daily_totals.items()},
-                "tx_timestamps": dict(self._tx_timestamps),
-                "last_tx_time": dict(self._last_tx_time),
-            }
-            tmp = self._state_path.with_suffix('.json.tmp')
-            tmp.write_text(json.dumps(payload, indent=2))
-            os.replace(tmp, self._state_path)
+            frozen = self._frozen
+            daily = {k: str(v) for k, v in self._daily_totals.items()}
+            timestamps = {k: list(v) for k, v in self._tx_timestamps.items()}
+            last = dict(self._last_tx_time)
+
+            def _merge(existing):
+                existing = existing or {}
+                # freeze/unfreeze should not destroy other fields; keep latest known
+                return {
+                    "frozen": frozen,
+                    "daily_totals": daily or dict(existing.get("daily_totals", {}) or {}),
+                    "tx_timestamps": timestamps or dict(existing.get("tx_timestamps", {}) or {}),
+                    "last_tx_time": last or dict(existing.get("last_tx_time", {}) or {}),
+                }
+
+            update_json(self._state_path, {}, _merge)
         except Exception as e:
             logger.warning("Failed to save wallet policy state: %s", e)

@@ -21,6 +21,7 @@ from typing import Dict, List, Optional
 
 from keystore.client import KeystoreClient
 from wallet.chains import ChainProvider, Balance, TransactionResult, GasEstimate
+from wallet.file_state import read_json, update_json
 
 logger = logging.getLogger(__name__)
 
@@ -120,6 +121,13 @@ class WalletManager:
         else:
             raise WalletError(f"Chain '{chain}' doesn't support key generation")
 
+        existing = self._find_wallet_by_chain_address(chain, address)
+        if existing:
+            raise WalletError(
+                f"Wallet already exists for {chain}:{address} (wallet_id={existing.wallet_id}). "
+                "Use 'hermes wallet list' or 'hermes wallet export' for migration instead."
+            )
+
         wallet_id = f"w_{uuid.uuid4().hex[:12]}"
         now = datetime.now(timezone.utc).isoformat()
 
@@ -170,6 +178,12 @@ class WalletManager:
             address = provider.address_from_key(private_key)
         else:
             raise WalletError(f"Chain '{chain}' doesn't support key import")
+
+        existing = self._find_wallet_by_chain_address(chain, address)
+        if existing:
+            raise WalletError(
+                f"Wallet already exists for {chain}:{address} (wallet_id={existing.wallet_id})."
+            )
 
         wallet_id = f"w_{uuid.uuid4().hex[:12]}"
         now = datetime.now(timezone.utc).isoformat()
@@ -235,10 +249,14 @@ class WalletManager:
         except WalletNotFound:
             return False
 
-        # Delete key and metadata
-        key_name = f"wallet:{wallet.chain}:{wallet.address}"
-        self._ks.delete_secret(key_name)
+        # Delete metadata first
         self._ks.delete_secret(f"wallet:meta:{wallet_id}")
+
+        # Delete private key only if no other wallet metadata points at it
+        still_referenced = self._find_wallet_by_chain_address(wallet.chain, wallet.address)
+        if not still_referenced:
+            key_name = f"wallet:{wallet.chain}:{wallet.address}"
+            self._ks.delete_secret(key_name)
         logger.info("Deleted wallet '%s' (%s)", wallet.label, wallet.address)
         return True
 
@@ -322,13 +340,14 @@ class WalletManager:
             requested_at=datetime.now(timezone.utc).isoformat(),
             decided_by=decided_by,
         )
-        self._tx_log.append(tx_record)
-        self._save_tx_log()
+        self._append_tx_log(tx_record)
 
         return result
 
     def get_tx_history(self, wallet_id: Optional[str] = None, limit: int = 20) -> List[TxRecord]:
         """Get transaction history from durable local log."""
+        # Refresh from disk so multiple processes see latest state.
+        self._tx_log = self._load_tx_log()
         records = self._tx_log
         if wallet_id:
             records = [r for r in records if r.wallet_id == wallet_id]
@@ -336,21 +355,36 @@ class WalletManager:
 
     def _load_tx_log(self) -> List[TxRecord]:
         try:
-            if not self._tx_log_path.exists():
-                return []
-            data = json.loads(self._tx_log_path.read_text())
+            data = read_json(self._tx_log_path, [])
             return [TxRecord(**item) for item in data]
         except Exception as e:
             logger.warning("Failed to load wallet tx log: %s", e)
             return []
 
-    def _save_tx_log(self) -> None:
+    def _append_tx_log(self, record: TxRecord) -> None:
         try:
-            tmp = self._tx_log_path.with_suffix('.json.tmp')
-            tmp.write_text(json.dumps([asdict(r) for r in self._tx_log], indent=2))
-            os.replace(tmp, self._tx_log_path)
+            def _merge(current):
+                current = current or []
+                current.append(asdict(record))
+                return current
+            merged = update_json(self._tx_log_path, [], _merge)
+            self._tx_log = [TxRecord(**item) for item in merged]
         except Exception as e:
-            logger.warning("Failed to save wallet tx log: %s", e)
+            logger.warning("Failed to append wallet tx log: %s", e)
+
+    def _find_wallet_by_chain_address(self, chain: str, address: str) -> Optional[WalletInfo]:
+        for secret in self._ks.list_secrets():
+            if secret.name.startswith("wallet:meta:"):
+                meta_json = self._ks.get_secret(secret.name, requester="wallet")
+                if not meta_json:
+                    continue
+                try:
+                    meta = json.loads(meta_json)
+                except Exception:
+                    continue
+                if meta.get("chain") == chain and meta.get("address") == address:
+                    return WalletInfo(**meta)
+        return None
 
     # ------------------------------------------------------------------
     # Helpers

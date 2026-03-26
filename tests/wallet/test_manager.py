@@ -29,6 +29,7 @@ class FakeProvider(ChainProvider):
         ))
         self._balances = {}
         self._next_tx_hash = "0xabcdef1234567890"
+        self._counter = 0
 
     def get_balance(self, address: str) -> Balance:
         bal = self._balances.get(address, Decimal("1.5"))
@@ -58,7 +59,9 @@ class FakeProvider(ChainProvider):
         return address.startswith("0x") and len(address) == 42
 
     def generate_keypair(self):
-        return ("0x" + "A" * 40, "deadbeef" * 8)
+        self._counter += 1
+        suffix = format(self._counter, "040x")[-40:]
+        return ("0x" + suffix.upper(), ("deadbeef" * 7) + format(self._counter, "08x"))
 
     @staticmethod
     def address_from_key(private_key: str) -> str:
@@ -132,6 +135,32 @@ class TestImport:
         )
         assert w.label == "Imported"
         assert w.address == "0x" + "B" * 40  # from FakeProvider.address_from_key
+
+    def test_duplicate_import_same_address_rejected(self, mgr):
+        mgr.import_wallet(chain="test-chain", private_key="deadbeef" * 8, label="Imported")
+        with pytest.raises(WalletError, match="already exists"):
+            mgr.import_wallet(chain="test-chain", private_key="deadbeef" * 8, label="Imported Again")
+
+    def test_delete_does_not_remove_shared_key_of_other_wallet(self, mgr):
+        # Create one wallet via import, then manually create a second metadata alias to same address
+        w = mgr.import_wallet(chain="test-chain", private_key="deadbeef" * 8, label="Imported")
+        # Direct metadata insert simulates legacy duplicate state
+        mgr._ks.set_secret(
+            "wallet:meta:w_dup",
+            json.dumps({
+                "wallet_id": "w_dup",
+                "label": "Duplicate",
+                "chain": w.chain,
+                "address": w.address,
+                "wallet_type": "user",
+                "created_at": w.created_at,
+            }),
+            category="sealed",
+        )
+        assert mgr.delete_wallet(w.wallet_id)
+        # Duplicate metadata should still be able to export/read key
+        dup = mgr.get_wallet("w_dup")
+        assert mgr.export_private_key(dup.wallet_id)
 
 
 class TestBalance:

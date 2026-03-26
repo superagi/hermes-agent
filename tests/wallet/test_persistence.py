@@ -82,6 +82,24 @@ def test_tx_history_persists_across_manager_instances(ks, tmp_path):
     assert hist[0].tx_hash == "0xabc"
 
 
+def test_tx_history_merges_across_multiple_manager_instances(ks, tmp_path):
+    state_dir = tmp_path / "wallet"
+    mgr1 = WalletManager(ks, state_dir=state_dir)
+    mgr1.register_provider("test-chain", FakeProvider())
+    w = mgr1.create_wallet(chain="test-chain")
+
+    mgr2 = WalletManager(ks, state_dir=state_dir)
+    mgr2.register_provider("test-chain", FakeProvider())
+
+    mgr1.send(w.wallet_id, "0xreceiver1", Decimal("1.0"), decided_by="owner_cli", policy_result='{}')
+    mgr2.send(w.wallet_id, "0xreceiver2", Decimal("2.0"), decided_by="owner_cli", policy_result='{}')
+
+    mgr3 = WalletManager(ks, state_dir=state_dir)
+    mgr3.register_provider("test-chain", FakeProvider())
+    hist = mgr3.get_tx_history(w.wallet_id, limit=10)
+    assert len(hist) == 2
+
+
 def test_policy_freeze_persists_across_instances(tmp_path):
     state = tmp_path / "wallet" / "policy_state.json"
     p1 = PolicyEngine(state_path=state)
@@ -107,8 +125,42 @@ def test_policy_record_transaction_persists(tmp_path):
     p1.record_transaction(tx)
 
     p2 = PolicyEngine(state_path=state)
-    # same transaction should now trip cooldown default if configured explicitly
     p2._policies = {"cooldown": {"min_seconds": 99999}}
     result = p2.evaluate(tx)
     assert result.verdict == PolicyVerdict.BLOCK
     assert result.failed == "cooldown"
+
+
+def test_policy_record_transaction_merges_across_instances(tmp_path):
+    state = tmp_path / "wallet" / "policy_state.json"
+    tx = TxRequest(
+        wallet_id="w1", wallet_type="agent", chain="test-chain",
+        to_address="0xreceiver", amount=Decimal("1.0"), symbol="TEST",
+    )
+    p1 = PolicyEngine(state_path=state)
+    p2 = PolicyEngine(state_path=state)
+    p1.record_transaction(tx)
+    p2.record_transaction(tx)
+
+    p3 = PolicyEngine(state_path=state, policies={"daily_limit": {"max_native": "1.5"}})
+    result = p3.evaluate(tx)
+    assert result.verdict == PolicyVerdict.BLOCK
+    assert result.failed == "daily_limit"
+
+
+def test_user_wallet_hard_blocks_run_before_require_approval(tmp_path):
+    state = tmp_path / "wallet" / "policy_state.json"
+    p = PolicyEngine(
+        state_path=state,
+        policies={
+            "spending_limit": {"max_native": "0.5"},
+            "blocked_recipients": {"addresses": ["0xblocked"]},
+        },
+    )
+    tx = TxRequest(
+        wallet_id="w1", wallet_type="user", chain="test-chain",
+        to_address="0xblocked", amount=Decimal("1.0"), symbol="TEST",
+    )
+    result = p.evaluate(tx)
+    assert result.verdict == PolicyVerdict.BLOCK
+    assert result.failed in {"spending_limit", "blocked_recipients"}
