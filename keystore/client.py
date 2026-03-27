@@ -190,10 +190,11 @@ class KeystoreClient:
                 refreshed.
             external_managed_names: Optional set of env-var names that were
                 supplied by non-keystore sources during the current refresh
-                cycle (e.g. .env, config bridging, shell/systemd env). This
-                lets long-lived processes distinguish a stale injected value
-                from an external replacement even when the replacement uses the
-                same credential string.
+                cycle and explicitly passed in by the caller. In the current
+                gateway implementation this is used for `.env`-tracked names.
+                This lets long-lived processes distinguish a stale injected
+                value from an external replacement even when the replacement
+                uses the same credential string.
 
         Returns:
             Dict of ``{secret_name: injected_or_overwritten}``.

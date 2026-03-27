@@ -101,8 +101,9 @@ def _inject_keystore_env(force: bool = False, external_managed_names: set[str] |
     Args:
         force: If True, refresh previously keystore-injected values.
         external_managed_names: Names sourced externally during the current
-            gateway refresh cycle (.env/config/system env). These remain
-            authoritative even during forced refresh.
+            gateway refresh cycle (currently `.env`-tracked names passed by
+            gateway orchestration). These remain authoritative even during
+            forced refresh.
 
     Runs independently of config.yaml so gateway/headless deployments using
     only a keystore (with stubbed .env) still receive credentials.
