@@ -145,6 +145,7 @@ PLATFORMS = {
     "wecom": {"label": "💬 WeCom", "default_toolset": "hermes-wecom"},
     "api_server": {"label": "🌐 API Server", "default_toolset": "hermes-api-server"},
     "mattermost": {"label": "💬 Mattermost", "default_toolset": "hermes-mattermost"},
+    "superagi":  {"label": "🤖 SuperAGI",   "default_toolset": "hermes-superagi"},
 }
 
 

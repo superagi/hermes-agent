@@ -256,6 +256,11 @@ PLATFORM_HINTS = {
         "only — no markdown, no formatting. SMS messages are limited to ~1600 "
         "characters, so be brief and direct."
     ),
+    "superagi": (
+        "You are on SuperAGI, an enterprise messaging platform. "
+        "Use plain text formatting — markdown does not render. "
+        "Keep responses clear and concise."
+    ),
 }
 
 CONTEXT_FILE_MAX_CHARS = 20_000

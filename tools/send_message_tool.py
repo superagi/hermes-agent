@@ -42,7 +42,7 @@ SEND_MESSAGE_SCHEMA = {
             },
             "target": {
                 "type": "string",
-                "description": "Delivery target. Format: 'platform' (uses home channel), 'platform:#channel-name', 'platform:chat_id', or Telegram topic 'telegram:chat_id:thread_id'. Examples: 'telegram', 'telegram:-1001234567890:17585', 'discord:#bot-home', 'slack:#engineering', 'signal:+15551234567'"
+                "description": "Delivery target. Format: 'platform' (uses home channel), 'platform:#channel-name', 'platform:chat_id', or Telegram topic 'telegram:chat_id:thread_id'. Examples: 'telegram', 'telegram:-1001234567890:17585', 'discord:#bot-home', 'slack:#engineering', 'signal:+15551234567', 'superagi:12345'"
             },
             "message": {
                 "type": "string",
@@ -133,6 +133,7 @@ def _handle_send(args):
         "wecom": Platform.WECOM,
         "email": Platform.EMAIL,
         "sms": Platform.SMS,
+        "superagi": Platform.SUPERAGI,
     }
     platform = platform_map.get(platform_name)
     if not platform:
@@ -305,6 +306,12 @@ async def _send_to_platform(platform, pconfig, chat_id, message, thread_id=None,
     if _feishu_available:
         _MAX_LENGTHS[Platform.FEISHU] = FeishuAdapter.MAX_MESSAGE_LENGTH
 
+    try:
+        from gateway.platforms.superagi import SuperAGIAdapter as _SuperAGIAdapter
+        _MAX_LENGTHS[Platform.SUPERAGI] = _SuperAGIAdapter.MAX_MESSAGE_LENGTH
+    except ImportError:
+        pass
+
     # Smart-chunk the message to fit within platform limits.
     # For short messages or platforms without a known limit this is a no-op.
     max_len = _MAX_LENGTHS.get(platform)
@@ -371,6 +378,8 @@ async def _send_to_platform(platform, pconfig, chat_id, message, thread_id=None,
             result = await _send_feishu(pconfig, chat_id, chunk, thread_id=thread_id)
         elif platform == Platform.WECOM:
             result = await _send_wecom(pconfig.extra, chat_id, chunk)
+        elif platform == Platform.SUPERAGI:
+            result = await _send_superagi(pconfig.api_key, pconfig.extra, chat_id, chunk)
         else:
             result = {"error": f"Direct sending not yet implemented for {platform.value}"}
 
@@ -822,6 +831,15 @@ async def _send_wecom(extra, chat_id, message):
             await adapter.disconnect()
     except Exception as e:
         return {"error": f"WeCom send failed: {e}"}
+
+
+async def _send_superagi(api_key, extra, chat_id, message):
+    """Send via SuperAGI REST API (standalone, no MQTT needed)."""
+    from gateway.platforms.superagi import send_superagi_message
+    api_base_url = extra.get("api_base_url", "")
+    if not api_key or not api_base_url:
+        return {"error": "SuperAGI: SUPERAGI_API_KEY and SUPERAGI_API_BASE_URL required"}
+    return await send_superagi_message(api_key, api_base_url, chat_id, message)
 
 
 async def _send_feishu(pconfig, chat_id, message, media_files=None, thread_id=None):

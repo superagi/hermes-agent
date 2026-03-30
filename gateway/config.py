@@ -55,6 +55,7 @@ class Platform(Enum):
     EMAIL = "email"
     SMS = "sms"
     DINGTALK = "dingtalk"
+    SUPERAGI = "superagi"
     API_SERVER = "api_server"
     WEBHOOK = "webhook"
     FEISHU = "feishu"
@@ -883,6 +884,33 @@ def _apply_env_overrides(config: GatewayConfig) -> None:
                 platform=Platform.WECOM,
                 chat_id=wecom_home,
                 name=os.getenv("WECOM_HOME_CHANNEL_NAME", "Home"),
+            )
+
+    # SuperAGI — only API_KEY + BOT_USER_ID + WORKSPACE_ID are strictly required;
+    # API_BASE_URL and MQTT_URL have defaults matching the openclaw deployment.
+    superagi_api_key = os.getenv("SUPERAGI_API_KEY")
+    superagi_bot_user_id = os.getenv("SUPERAGI_BOT_USER_ID")
+    superagi_workspace_id = os.getenv("SUPERAGI_WORKSPACE_ID")
+    if superagi_api_key and superagi_bot_user_id and superagi_workspace_id:
+        if Platform.SUPERAGI not in config.platforms:
+            config.platforms[Platform.SUPERAGI] = PlatformConfig()
+        config.platforms[Platform.SUPERAGI].enabled = True
+        config.platforms[Platform.SUPERAGI].api_key = superagi_api_key
+        config.platforms[Platform.SUPERAGI].extra.update({
+            "api_base_url": os.getenv("SUPERAGI_API_BASE_URL", "https://api.superagi.com/chat"),
+            "bot_user_id": superagi_bot_user_id,
+            "workspace_id": superagi_workspace_id,
+            "mqtt_url": os.getenv("SUPERAGI_MQTT_URL", "ws://emqx.superagi.com:8083/mqtt"),
+            "mqtt_username": os.getenv("SUPERAGI_MQTT_USERNAME", "supersales"),
+            "mqtt_password": os.getenv("SUPERAGI_MQTT_PASSWORD", ""),
+            "env": os.getenv("SUPERAGI_ENV", "production"),
+        })
+        superagi_home = os.getenv("SUPERAGI_HOME_CHANNEL")
+        if superagi_home:
+            config.platforms[Platform.SUPERAGI].home_channel = HomeChannel(
+                platform=Platform.SUPERAGI,
+                chat_id=superagi_home,
+                name=os.getenv("SUPERAGI_HOME_CHANNEL_NAME", "Home"),
             )
 
     # Session settings
