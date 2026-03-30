@@ -80,6 +80,11 @@ _DEFAULT_PROVIDER_MODELS = {
     "minimax-cn": ["MiniMax-M2.7", "MiniMax-M2.7-highspeed", "MiniMax-M2.5", "MiniMax-M2.5-highspeed", "MiniMax-M2.1"],
     "ai-gateway": ["anthropic/claude-opus-4.6", "anthropic/claude-sonnet-4.6", "openai/gpt-5", "google/gemini-3-flash"],
     "kilocode": ["anthropic/claude-opus-4.6", "anthropic/claude-sonnet-4.6", "openai/gpt-5.4", "google/gemini-3-pro-preview", "google/gemini-3-flash-preview"],
+    "huggingface": [
+        "Qwen/Qwen3.5-397B-A17B", "Qwen/Qwen3-235B-A22B-Thinking-2507",
+        "Qwen/Qwen3-Coder-480B-A35B-Instruct", "deepseek-ai/DeepSeek-R1-0528",
+        "deepseek-ai/DeepSeek-V3.2", "moonshotai/Kimi-K2.5",
+    ],
 }
 
 
@@ -284,6 +289,7 @@ from hermes_cli.config import (
     get_env_value,
     ensure_hermes_home,
 )
+# display_hermes_home imported lazily at call sites (stale-module safety during hermes update)
 
 from hermes_cli.colors import Colors, color
 
@@ -580,11 +586,11 @@ def _print_setup_summary(config: dict, hermes_home):
     else:
         tool_status.append(("Mixture of Agents", False, "OPENROUTER_API_KEY"))
 
-    # Web tools (Parallel, Firecrawl, or Tavily)
-    if get_env_value("PARALLEL_API_KEY") or get_env_value("FIRECRAWL_API_KEY") or get_env_value("FIRECRAWL_API_URL") or get_env_value("TAVILY_API_KEY"):
+    # Web tools (Exa, Parallel, Firecrawl, or Tavily)
+    if get_env_value("EXA_API_KEY") or get_env_value("PARALLEL_API_KEY") or get_env_value("FIRECRAWL_API_KEY") or get_env_value("FIRECRAWL_API_URL") or get_env_value("TAVILY_API_KEY"):
         tool_status.append(("Web Search & Extract", True, None))
     else:
-        tool_status.append(("Web Search & Extract", False, "PARALLEL_API_KEY, FIRECRAWL_API_KEY, or TAVILY_API_KEY"))
+        tool_status.append(("Web Search & Extract", False, "EXA_API_KEY, PARALLEL_API_KEY, FIRECRAWL_API_KEY, or TAVILY_API_KEY"))
 
     # Browser tools (local Chromium or Browserbase cloud)
     import shutil
@@ -678,7 +684,8 @@ def _print_setup_summary(config: dict, hermes_home):
         print_warning(
             "Some tools are disabled. Run 'hermes setup tools' to configure them,"
         )
-        print_warning("or edit ~/.hermes/.env directly to add the missing API keys.")
+        from hermes_constants import display_hermes_home as _dhh
+        print_warning(f"or edit {_dhh()}/.env directly to add the missing API keys.")
         print()
 
     # Done banner
@@ -701,7 +708,8 @@ def _print_setup_summary(config: dict, hermes_home):
     print()
 
     # Show file locations prominently
-    print(color("📁 All your files are in ~/.hermes/:", Colors.CYAN, Colors.BOLD))
+    from hermes_constants import display_hermes_home as _dhh
+    print(color(f"📁 All your files are in {_dhh()}/:", Colors.CYAN, Colors.BOLD))
     print()
     print(f"   {color('Settings:', Colors.YELLOW)}  {get_config_path()}")
     print(f"   {color('API Keys:', Colors.YELLOW)}  {get_env_path()}")
@@ -884,6 +892,7 @@ def setup_model_provider(config: dict):
         "OpenCode Go (open models, $10/month subscription)",
         "GitHub Copilot (uses GITHUB_TOKEN or gh auth token)",
         "GitHub Copilot ACP (spawns `copilot --acp --stdio`)",
+        "Hugging Face Inference Providers (20+ open models)",
     ]
     if keep_label:
         provider_choices.append(keep_label)
@@ -993,10 +1002,9 @@ def setup_model_provider(config: dict):
                     min_key_ttl_seconds=5 * 60,
                     timeout_seconds=15.0,
                 )
-                nous_models = fetch_nous_models(
-                    inference_base_url=creds.get("base_url", ""),
-                    api_key=creds.get("api_key", ""),
-                )
+                # Use curated model list instead of full /models dump
+                from hermes_cli.models import _PROVIDER_MODELS
+                nous_models = _PROVIDER_MODELS.get("nous", [])
             except Exception as e:
                 logger.debug("Could not fetch Nous models after login: %s", e)
 
@@ -1528,7 +1536,26 @@ def setup_model_provider(config: dict):
         _set_model_provider(config, "copilot-acp", pconfig.inference_base_url)
         selected_base_url = pconfig.inference_base_url
 
-    # else: provider_idx == 16 (Keep current) — only shown when a provider already exists
+    elif provider_idx == 16:  # Hugging Face Inference Providers
+        selected_provider = "huggingface"
+        print()
+        print_header("Hugging Face API Token")
+        pconfig = PROVIDER_REGISTRY["huggingface"]
+        print_info(f"Provider: {pconfig.name}")
+        print_info("Get your token at: https://huggingface.co/settings/tokens")
+        print_info("Required permission: 'Make calls to Inference Providers'")
+        print()
+
+        api_key = prompt("  HF Token", password=True)
+        if api_key:
+            save_env_value("HF_TOKEN", api_key)
+            # Clear OpenRouter env vars to prevent routing confusion
+            save_env_value("OPENAI_BASE_URL", "")
+            save_env_value("OPENAI_API_KEY", "")
+        _set_model_provider(config, "huggingface", pconfig.inference_base_url)
+        selected_base_url = pconfig.inference_base_url
+
+    # else: provider_idx == 17 (Keep current) — only shown when a provider already exists
     # Normalize "keep current" to an explicit provider so downstream logic
     # doesn't fall back to the generic OpenRouter/static-model path.
     if selected_provider is None:
@@ -2067,11 +2094,11 @@ def setup_terminal_backend(config: dict):
         print_info("Serverless cloud sandboxes. Each session gets its own container.")
         print_info("Requires a Modal account: https://modal.com")
 
-        # Check if swe-rex[modal] is installed
+        # Check if modal SDK is installed
         try:
-            __import__("swe_rex")
+            __import__("modal")
         except ImportError:
-            print_info("Installing swe-rex[modal]...")
+            print_info("Installing modal SDK...")
             import subprocess
 
             uv_bin = shutil.which("uv")
@@ -2083,22 +2110,22 @@ def setup_terminal_backend(config: dict):
                         "install",
                         "--python",
                         sys.executable,
-                        "swe-rex[modal]",
+                        "modal",
                     ],
                     capture_output=True,
                     text=True,
                 )
             else:
                 result = subprocess.run(
-                    [sys.executable, "-m", "pip", "install", "swe-rex[modal]"],
+                    [sys.executable, "-m", "pip", "install", "modal"],
                     capture_output=True,
                     text=True,
                 )
             if result.returncode == 0:
-                print_success("swe-rex[modal] installed")
+                print_success("modal SDK installed")
             else:
                 print_warning(
-                    "Install failed — run manually: pip install 'swe-rex[modal]'"
+                    "Install failed — run manually: pip install modal"
                 )
 
         # Modal token
@@ -2682,10 +2709,38 @@ def setup_gateway(config: dict):
         if token or get_env_value("MATRIX_PASSWORD"):
             # E2EE
             print()
-            if prompt_yes_no("Enable end-to-end encryption (E2EE)?", False):
+            want_e2ee = prompt_yes_no("Enable end-to-end encryption (E2EE)?", False)
+            if want_e2ee:
                 save_env_value("MATRIX_ENCRYPTION", "true")
                 print_success("E2EE enabled")
-                print_info("   Requires: pip install 'matrix-nio[e2e]'")
+
+            # Auto-install matrix-nio
+            matrix_pkg = "matrix-nio[e2e]" if want_e2ee else "matrix-nio"
+            try:
+                __import__("nio")
+            except ImportError:
+                print_info(f"Installing {matrix_pkg}...")
+                import subprocess
+
+                uv_bin = shutil.which("uv")
+                if uv_bin:
+                    result = subprocess.run(
+                        [uv_bin, "pip", "install", "--python", sys.executable, matrix_pkg],
+                        capture_output=True,
+                        text=True,
+                    )
+                else:
+                    result = subprocess.run(
+                        [sys.executable, "-m", "pip", "install", matrix_pkg],
+                        capture_output=True,
+                        text=True,
+                    )
+                if result.returncode == 0:
+                    print_success(f"{matrix_pkg} installed")
+                else:
+                    print_warning(f"Install failed — run manually: pip install '{matrix_pkg}'")
+                    if result.stderr:
+                        print_info(f"  Error: {result.stderr.strip().splitlines()[-1]}")
 
             # Allowed users
             print()
@@ -2812,7 +2867,8 @@ def setup_gateway(config: dict):
         save_env_value("WEBHOOK_ENABLED", "true")
         print()
         print_success("Webhooks enabled! Next steps:")
-        print_info("   1. Define webhook routes in ~/.hermes/config.yaml")
+        from hermes_constants import display_hermes_home as _dhh
+        print_info(f"   1. Define webhook routes in {_dhh()}/config.yaml")
         print_info("   2. Point your service (GitHub, GitLab, etc.) at:")
         print_info("      http://your-server:8644/webhooks/<route-name>")
         print()

@@ -160,7 +160,7 @@ PROVIDER_REGISTRY: Dict[str, ProviderConfig] = {
         id="alibaba",
         name="Alibaba Cloud (DashScope)",
         auth_type="api_key",
-        inference_base_url="https://dashscope-intl.aliyuncs.com/apps/anthropic",
+        inference_base_url="https://coding-intl.dashscope.aliyuncs.com/v1",
         api_key_env_vars=("DASHSCOPE_API_KEY",),
         base_url_env_var="DASHSCOPE_BASE_URL",
     ),
@@ -211,6 +211,14 @@ PROVIDER_REGISTRY: Dict[str, ProviderConfig] = {
         inference_base_url="https://api.kilo.ai/api/gateway",
         api_key_env_vars=("KILOCODE_API_KEY",),
         base_url_env_var="KILOCODE_BASE_URL",
+    ),
+    "huggingface": ProviderConfig(
+        id="huggingface",
+        name="Hugging Face",
+        auth_type="api_key",
+        inference_base_url="https://router.huggingface.co/v1",
+        api_key_env_vars=("HF_TOKEN",),
+        base_url_env_var="HF_BASE_URL",
     ),
 }
 
@@ -685,8 +693,13 @@ def resolve_provider(
         "github-copilot-acp": "copilot-acp", "copilot-acp-agent": "copilot-acp",
         "aigateway": "ai-gateway", "vercel": "ai-gateway", "vercel-ai-gateway": "ai-gateway",
         "opencode": "opencode-zen", "zen": "opencode-zen",
+        "hf": "huggingface", "hugging-face": "huggingface", "huggingface-hub": "huggingface",
         "go": "opencode-go", "opencode-go-sub": "opencode-go",
         "kilo": "kilocode", "kilo-code": "kilocode", "kilo-gateway": "kilocode",
+        # Local server aliases — route through the generic custom provider
+        "lmstudio": "custom", "lm-studio": "custom", "lm_studio": "custom",
+        "ollama": "custom", "vllm": "custom", "llamacpp": "custom",
+        "llama.cpp": "custom", "llama-cpp": "custom",
     }
     normalized = _PROVIDER_ALIASES.get(normalized, normalized)
 
@@ -733,7 +746,12 @@ def resolve_provider(
             if has_usable_secret(os.getenv(env_var, "")):
                 return pid
 
-    return "openrouter"
+    raise AuthError(
+        "No inference provider configured. Run 'hermes model' to choose a "
+        "provider and model, or set an API key (OPENROUTER_API_KEY, "
+        "OPENAI_API_KEY, etc.) in ~/.hermes/.env.",
+        code="no_provider_configured",
+    )
 
 
 # =============================================================================
@@ -2012,7 +2030,8 @@ def _login_openai_codex(args, pconfig: ProviderConfig) -> None:
     config_path = _update_config_for_provider("openai-codex", creds.get("base_url", DEFAULT_CODEX_BASE_URL))
     print()
     print("Login successful!")
-    print("  Auth state: ~/.hermes/auth.json")
+    from hermes_constants import display_hermes_home as _dhh
+    print(f"  Auth state: {_dhh()}/auth.json")
     print(f"  Config updated: {config_path} (model.provider=openai-codex)")
 
 
@@ -2291,21 +2310,20 @@ def _login_nous(args, pconfig: ProviderConfig) -> None:
                 raise AuthError("No runtime API key available to fetch models",
                                 provider="nous", code="invalid_token")
 
-            model_ids = fetch_nous_models(
-                inference_base_url=runtime_base_url,
-                api_key=runtime_key,
-                timeout_seconds=timeout_seconds,
-                verify=verify,
-            )
+            # Use curated model list (same as OpenRouter defaults) instead
+            # of the full /models dump which returns hundreds of models.
+            from hermes_cli.models import _PROVIDER_MODELS
+            model_ids = _PROVIDER_MODELS.get("nous", [])
 
             print()
             if model_ids:
+                print(f"Showing {len(model_ids)} curated models — use \"Enter custom model name\" for others.")
                 selected_model = _prompt_model_selection(model_ids)
                 if selected_model:
                     _save_model_choice(selected_model)
                     print(f"Default model set to: {selected_model}")
             else:
-                print("No models were returned by the inference API.")
+                print("No curated models available for Nous Portal.")
         except Exception as exc:
             message = format_auth_error(exc) if isinstance(exc, AuthError) else str(exc)
             print()
