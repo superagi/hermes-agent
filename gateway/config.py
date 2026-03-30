@@ -274,6 +274,9 @@ class GatewayConfig:
             # API Server uses enabled flag only (no token needed)
             elif platform == Platform.API_SERVER:
                 connected.append(platform)
+            # SuperAGI uses env vars for auth (SUPERAGI_API_KEY, etc.)
+            elif platform == Platform.SUPERAGI:
+                connected.append(platform)
             # Webhook uses enabled flag only (secrets are per-route)
             elif platform == Platform.WEBHOOK:
                 connected.append(platform)
