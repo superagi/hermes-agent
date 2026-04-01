@@ -125,6 +125,20 @@ class SuperAGIAdapter(BasePlatformAdapter):
             or os.getenv("SUPERAGI_ENV", "production")
         )
 
+        # Enabled groups filter — only respond to messages from these groups
+        _enabled_groups_raw = (
+            config.extra.get("enabled_groups", "")
+            or os.getenv("SUPERAGI_ENABLED_GROUPS", "")
+        )
+        self._enabled_groups: set[int] = set()
+        if _enabled_groups_raw:
+            for gid in str(_enabled_groups_raw).split(","):
+                gid = gid.strip()
+                if gid:
+                    self._enabled_groups.add(_to_int(gid))
+            if self._enabled_groups:
+                logger.info("SuperAGI: enabled groups filter active: %s", self._enabled_groups)
+
         self._mqtt_client: Any = None
         self._event_loop: Any = None  # captured during connect() for cross-thread dispatch
         self._closing = False
@@ -137,6 +151,11 @@ class SuperAGIAdapter(BasePlatformAdapter):
         self._SEEN_MAX = 2000
         self._SEEN_TTL = 300  # 5 minutes
 
+        # Track message IDs sent by this adapter (for self-message loop prevention)
+        self._sent_message_ids: Dict[str, float] = {}
+        self._SENT_MAX = 500
+        self._SENT_TTL = 300  # 5 minutes
+
         self._subscribed_groups: set[int] = set()
 
     # ------------------------------------------------------------------
@@ -144,10 +163,15 @@ class SuperAGIAdapter(BasePlatformAdapter):
     # ------------------------------------------------------------------
 
     def _api_headers(self) -> Dict[str, str]:
-        return {
+        headers = {
             "X-API-KEY": self._api_key,
             "Content-Type": "application/json",
         }
+        if self._workspace_id:
+            headers["X-Workspace-Id"] = str(self._workspace_id)
+        if self._bot_user_id:
+            headers["X-USER-ID"] = str(self._bot_user_id)
+        return headers
 
     async def _api_get(self, path: str, params: Optional[Dict] = None) -> Dict[str, Any]:
         url = f"{self._api_base_url}{path}"
@@ -362,9 +386,21 @@ class SuperAGIAdapter(BasePlatformAdapter):
         group_id = _to_int(payload.get("group_id", 0))
         message_id = str(payload.get("message_id", ""))
 
-        if sender_id == self._bot_user_id:
-            logger.debug("SuperAGI: skipping own sidebar message (sender=%s)", sender_id)
+        # Enabled groups filter — if set, only process messages from listed groups
+        if self._enabled_groups and group_id not in self._enabled_groups:
+            logger.debug("SuperAGI: skipping sidebar message from non-enabled group=%s", group_id)
             return
+
+        # Self-message check: use sent message tracking if enabled groups active (twin mode)
+        # Otherwise use sender_id check (regular digital employee mode)
+        if self._enabled_groups:
+            if self._is_sent_by_self(message_id):
+                logger.debug("SuperAGI: skipping own sent message_id=%s", message_id)
+                return
+        else:
+            if sender_id == self._bot_user_id:
+                logger.debug("SuperAGI: skipping own sidebar message (sender=%s)", sender_id)
+                return
 
         if not self._check_and_mark_seen(message_id):
             logger.debug("SuperAGI: dedup skip message_id=%s", message_id)
@@ -425,9 +461,20 @@ class SuperAGIAdapter(BasePlatformAdapter):
         group_id = _to_int(payload.get("group_id", 0))
         message_id = str(payload.get("message_id", ""))
 
-        if user_id == self._bot_user_id:
-            logger.debug("SuperAGI: skipping own group message (user=%s)", user_id)
+        # Enabled groups filter
+        if self._enabled_groups and group_id not in self._enabled_groups:
+            logger.debug("SuperAGI: skipping group message from non-enabled group=%s", group_id)
             return
+
+        # Self-message check
+        if self._enabled_groups:
+            if self._is_sent_by_self(message_id):
+                logger.debug("SuperAGI: skipping own sent group message_id=%s", message_id)
+                return
+        else:
+            if user_id == self._bot_user_id:
+                logger.debug("SuperAGI: skipping own group message (user=%s)", user_id)
+                return
 
         if not self._check_and_mark_seen(message_id):
             logger.debug("SuperAGI: dedup skip message_id=%s", message_id)
@@ -515,6 +562,28 @@ class SuperAGIAdapter(BasePlatformAdapter):
         return True
 
     # ------------------------------------------------------------------
+    # Sent message tracking (for self-message loop prevention in twin mode)
+    # ------------------------------------------------------------------
+
+    def _mark_as_sent(self, message_id: str) -> None:
+        """Track a message_id that we sent, so we can skip it on MQTT echo."""
+        if not message_id:
+            return
+        now = time.monotonic()
+        if len(self._sent_message_ids) > self._SENT_MAX:
+            cutoff = now - self._SENT_TTL
+            self._sent_message_ids = {
+                k: v for k, v in self._sent_message_ids.items() if v > cutoff
+            }
+        self._sent_message_ids[message_id] = now
+
+    def _is_sent_by_self(self, message_id: str) -> bool:
+        """Return True if this message_id was sent by this adapter."""
+        if not message_id:
+            return False
+        return message_id in self._sent_message_ids
+
+    # ------------------------------------------------------------------
     # Send
     # ------------------------------------------------------------------
 
@@ -557,6 +626,8 @@ class SuperAGIAdapter(BasePlatformAdapter):
             )
 
         msg_id = result.get("id") or result.get("message_id")
+        if msg_id:
+            self._mark_as_sent(str(msg_id))
         logger.info("SuperAGI: message sent to chat_id=%s msg_id=%s", chat_id, msg_id)
         return SendResult(success=True, message_id=str(msg_id) if msg_id else None)
 
