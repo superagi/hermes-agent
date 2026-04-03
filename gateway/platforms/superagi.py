@@ -156,6 +156,10 @@ class SuperAGIAdapter(BasePlatformAdapter):
         self._SENT_MAX = 500
         self._SENT_TTL = 300  # 5 minutes
 
+        # Fallback: track sent content hashes when API doesn't return message IDs
+        self._sent_content_hashes: Dict[str, float] = {}
+        self._SENT_HASH_TTL = 60  # 60 seconds — short window to match echoed replies
+
         self._subscribed_groups: set[int] = set()
 
     # ------------------------------------------------------------------
@@ -428,6 +432,12 @@ class SuperAGIAdapter(BasePlatformAdapter):
             logger.debug("SuperAGI: empty text in message_id=%s, skipping", message_id)
             return
 
+        # Content-hash self-message check (fallback when API doesn't return message IDs)
+        chat_id_str = str(group_id) if group_id else str(sender_id)
+        if self._is_content_sent_by_self(chat_id_str, text):
+            logger.debug("SuperAGI: skipping own message by content hash (group=%s)", group_id)
+            return
+
         sender_name = content.get("sender_name", content.get("user_name", ""))
         logger.info(
             "SuperAGI: received message from %s (%s): \"%s\"",
@@ -435,7 +445,6 @@ class SuperAGIAdapter(BasePlatformAdapter):
             text[:80] + ("..." if len(text) > 80 else ""),
         )
 
-        chat_id_str = str(group_id) if group_id else str(sender_id)
         source = self.build_source(
             chat_id=chat_id_str,
             chat_name=content.get("group_name", sender_name),
@@ -493,6 +502,11 @@ class SuperAGIAdapter(BasePlatformAdapter):
         text = content.get("text", content.get("content", content.get("message", ""))).strip()
         if not text:
             logger.debug("SuperAGI: empty text in message_id=%s, skipping", message_id)
+            return
+
+        # Content-hash self-message check (fallback when API doesn't return message IDs)
+        if self._is_content_sent_by_self(str(group_id), text):
+            logger.debug("SuperAGI: skipping own group message by content hash (group=%s)", group_id)
             return
 
         sender_name = content.get("sender_name", content.get("user_name", ""))
@@ -583,6 +597,33 @@ class SuperAGIAdapter(BasePlatformAdapter):
             return False
         return message_id in self._sent_message_ids
 
+    def _mark_content_sent(self, chat_id: str, content: str) -> None:
+        """Track a content hash so we can detect our own messages echoed back via MQTT."""
+        import hashlib
+        key = f"{chat_id}:{hashlib.sha256(content.strip().encode()).hexdigest()[:16]}"
+        now = time.monotonic()
+        # Evict stale entries
+        cutoff = now - self._SENT_HASH_TTL
+        if len(self._sent_content_hashes) > self._SENT_MAX:
+            self._sent_content_hashes = {
+                k: v for k, v in self._sent_content_hashes.items() if v > cutoff
+            }
+        self._sent_content_hashes[key] = now
+
+    def _is_content_sent_by_self(self, chat_id: str, content: str) -> bool:
+        """Return True if we recently sent this exact content to this chat."""
+        import hashlib
+        key = f"{chat_id}:{hashlib.sha256(content.strip().encode()).hexdigest()[:16]}"
+        ts = self._sent_content_hashes.get(key)
+        if ts is None:
+            return False
+        if time.monotonic() - ts > self._SENT_HASH_TTL:
+            del self._sent_content_hashes[key]
+            return False
+        # Remove after matching to allow the same content to be sent again later
+        del self._sent_content_hashes[key]
+        return True
+
     # ------------------------------------------------------------------
     # Send
     # ------------------------------------------------------------------
@@ -628,6 +669,9 @@ class SuperAGIAdapter(BasePlatformAdapter):
         msg_id = result.get("id") or result.get("message_id")
         if msg_id:
             self._mark_as_sent(str(msg_id))
+        else:
+            # API didn't return message ID — track by content hash as fallback
+            self._mark_content_sent(chat_id, content)
         logger.info("SuperAGI: message sent to chat_id=%s msg_id=%s", chat_id, msg_id)
         return SendResult(success=True, message_id=str(msg_id) if msg_id else None)
 
