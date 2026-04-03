@@ -647,6 +647,7 @@ class SuperAGIAdapter(BasePlatformAdapter):
             "recipient_type": 1,
             "recipient_id": _to_int(chat_id),
             "text": content,
+            "message_type": "twin_response",
         }
 
         logger.info(
