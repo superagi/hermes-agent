@@ -5,10 +5,10 @@ for receiving messages and the SuperAGI REST API for sending messages, typing
 indicators, and fetching message content.
 
 Environment variables:
-    SUPERAGI_API_KEY            X-API-KEY header for REST API
+    SUPERAGI_API_KEY            X-API-KEY header for REST API (primary workspace)
     SUPERAGI_API_BASE_URL       REST API base (e.g. https://api.superagi.com)
     SUPERAGI_BOT_USER_ID        Numeric bot user ID
-    SUPERAGI_WORKSPACE_ID       Numeric workspace ID
+    SUPERAGI_WORKSPACE_ID       Numeric workspace ID (primary)
     SUPERAGI_MQTT_URL           MQTT broker URL (ws://emqx.superagi.com:8083/mqtt)
     SUPERAGI_MQTT_USERNAME      MQTT username (default: supersales)
     SUPERAGI_MQTT_PASSWORD      MQTT password
@@ -16,6 +16,26 @@ Environment variables:
     SUPERAGI_HOME_CHANNEL       Default group_id for cron delivery
     SUPERAGI_ALLOWED_USERS      Comma-separated allowed user IDs
     SUPERAGI_ALLOW_ALL_USERS    Allow all users (true/false)
+
+    Cross-workspace twin sharing (new):
+    SUPERAGI_SUBSCRIPTIONS      JSON array of {workspace_id, group_id, api_key,
+                                api_base_url} tuples — one per (workspace, group)
+                                pair this sandbox should handle. Replaces the old
+                                comma-separated SUPERAGI_ENABLED_GROUPS format.
+                                On startup, subscriptions are also loaded from
+                                /workspace/.subscribed-groups.json (persisted
+                                across pause/resume). New subscriptions received
+                                via POST /admin/subscribe-group are merged in
+                                and persisted immediately.
+    SUPERAGI_ADMIN_PORT         Port for the admin HTTP server (default: 8001).
+                                Exposes POST /admin/subscribe-group for runtime
+                                subscription management.
+    SANDBOX_ID                  Sandbox identifier (injected by claw-service),
+                                used for sandbox-service heartbeat calls.
+    SANDBOX_SERVICE_URL         Internal URL of the sandbox service
+                                (e.g. http://sandbox-service:8111), used for
+                                heartbeat calls so the lifecycle worker doesn't
+                                auto-pause actively-used sandboxes.
 """
 
 from __future__ import annotations
@@ -125,19 +145,78 @@ class SuperAGIAdapter(BasePlatformAdapter):
             or os.getenv("SUPERAGI_ENV", "production")
         )
 
-        # Enabled groups filter — only respond to messages from these groups
-        _enabled_groups_raw = (
-            config.extra.get("enabled_groups", "")
-            or os.getenv("SUPERAGI_ENABLED_GROUPS", "")
+        # ── Cross-workspace subscription map ──────────────────────────────
+        # Each entry: {workspace_id, group_id, api_key, api_base_url}
+        # Indexed by group_id (int) for O(1) per-message lookup.
+        self._subscription_map: Dict[int, Dict[str, Any]] = {}
+
+        # 1. Parse SUPERAGI_SUBSCRIPTIONS JSON (new format)
+        _subs_raw = (
+            config.extra.get("subscriptions", "")
+            or os.getenv("SUPERAGI_SUBSCRIPTIONS", "")
         )
-        self._enabled_groups: set[int] = set()
-        if _enabled_groups_raw:
-            for gid in str(_enabled_groups_raw).split(","):
-                gid = gid.strip()
-                if gid:
-                    self._enabled_groups.add(_to_int(gid))
-            if self._enabled_groups:
-                logger.info("SuperAGI: enabled groups filter active: %s", self._enabled_groups)
+        if _subs_raw:
+            try:
+                subs = json.loads(_subs_raw)
+                for sub in subs:
+                    gid = _to_int(sub.get("group_id", 0))
+                    if gid:
+                        self._subscription_map[gid] = sub
+            except (json.JSONDecodeError, TypeError) as e:
+                logger.warning("SuperAGI: failed to parse SUPERAGI_SUBSCRIPTIONS: %s", e)
+
+        # 2. Merge persisted subscriptions from /workspace/.subscribed-groups.json
+        #    (survive pause/resume; written by _persist_subscriptions())
+        _persist_path = os.getenv("SUPERAGI_SUBSCRIPTIONS_PATH", "/workspace/.subscribed-groups.json")
+        self._subscriptions_persist_path = _persist_path
+        try:
+            if os.path.exists(_persist_path):
+                with open(_persist_path, encoding="utf-8") as _f:
+                    _persisted = json.load(_f)
+                for sub in _persisted:
+                    gid = _to_int(sub.get("group_id", 0))
+                    if gid and gid not in self._subscription_map:
+                        self._subscription_map[gid] = sub
+                if _persisted:
+                    logger.info(
+                        "SuperAGI: loaded %d persisted subscriptions from %s",
+                        len(self._subscription_map), _persist_path,
+                    )
+        except Exception as e:
+            logger.warning("SuperAGI: could not load persisted subscriptions: %s", e)
+
+        # 3. Fallback: old SUPERAGI_ENABLED_GROUPS comma-separated format
+        #    (only used when no SUBSCRIPTIONS were provided — single-workspace case)
+        if not self._subscription_map:
+            _enabled_groups_raw = (
+                config.extra.get("enabled_groups", "")
+                or os.getenv("SUPERAGI_ENABLED_GROUPS", "")
+            )
+            if _enabled_groups_raw:
+                for _gid_str in str(_enabled_groups_raw).split(","):
+                    _gid_str = _gid_str.strip()
+                    if _gid_str:
+                        _gid = _to_int(_gid_str)
+                        if _gid:
+                            # Legacy: use primary workspace credentials for all groups
+                            self._subscription_map[_gid] = {
+                                "workspace_id": self._workspace_id,
+                                "group_id": _gid,
+                                "api_key": self._api_key,
+                                "api_base_url": self._api_base_url,
+                            }
+
+        # Enabled groups set (derived from map) — for fast membership checks
+        self._enabled_groups: set[int] = set(self._subscription_map.keys())
+        if self._enabled_groups:
+            logger.info("SuperAGI: enabled groups filter active: %s", self._enabled_groups)
+
+        # Admin HTTP server config
+        self._admin_port: int = int(os.getenv("SUPERAGI_ADMIN_PORT", "8001"))
+
+        # Sandbox heartbeat config (prevents auto-pause during active use)
+        self._sandbox_id: str = os.getenv("SANDBOX_ID", "")
+        self._sandbox_service_url: str = os.getenv("SANDBOX_SERVICE_URL", "").rstrip("/")
 
         self._mqtt_client: Any = None
         self._event_loop: Any = None  # captured during connect() for cross-thread dispatch
@@ -166,22 +245,54 @@ class SuperAGIAdapter(BasePlatformAdapter):
     # HTTP helpers
     # ------------------------------------------------------------------
 
-    def _api_headers(self) -> Dict[str, str]:
+    def _api_headers(self, api_key: Optional[str] = None, workspace_id: Optional[int] = None) -> Dict[str, str]:
         headers = {
-            "X-API-KEY": self._api_key,
+            "X-API-KEY": api_key if api_key is not None else self._api_key,
             "Content-Type": "application/json",
         }
-        if self._workspace_id:
-            headers["X-Workspace-Id"] = str(self._workspace_id)
+        ws = workspace_id if workspace_id is not None else self._workspace_id
+        if ws:
+            headers["X-Workspace-Id"] = str(ws)
         if self._bot_user_id:
             headers["X-USER-ID"] = str(self._bot_user_id)
         return headers
+
+    def _credentials_for_group(self, group_id: int) -> tuple[str, str, int]:
+        """Return (api_key, api_base_url, workspace_id) for the given group.
+
+        Falls back to the primary credentials when the group has no dedicated
+        subscription entry (e.g. non-twin / legacy single-workspace path).
+        """
+        sub = self._subscription_map.get(group_id)
+        if sub:
+            return (
+                sub.get("api_key", self._api_key),
+                sub.get("api_base_url", self._api_base_url).rstrip("/"),
+                _to_int(sub.get("workspace_id", self._workspace_id)),
+            )
+        return self._api_key, self._api_base_url, self._workspace_id
 
     async def _api_get(self, path: str, params: Optional[Dict] = None) -> Dict[str, Any]:
         url = f"{self._api_base_url}{path}"
         try:
             resp = await self._http_session.get(
                 url, headers=self._api_headers(), params=params
+            )
+            if resp.status_code >= 400:
+                text = resp.text[:200]
+                logger.warning("SuperAGI API GET %s -> %d: %s", path, resp.status_code, text)
+                return {"error": f"HTTP {resp.status_code}: {text}"}
+            return resp.json()
+        except Exception as e:
+            logger.error("SuperAGI API GET %s failed: %s", path, e)
+            return {"error": str(e)}
+
+    async def _api_get_for_group(self, group_id: int, path: str, params: Optional[Dict] = None) -> Dict[str, Any]:
+        api_key, api_base_url, workspace_id = self._credentials_for_group(group_id)
+        url = f"{api_base_url}{path}"
+        try:
+            resp = await self._http_session.get(
+                url, headers=self._api_headers(api_key, workspace_id), params=params
             )
             if resp.status_code >= 400:
                 text = resp.text[:200]
@@ -207,6 +318,22 @@ class SuperAGIAdapter(BasePlatformAdapter):
             logger.error("SuperAGI API POST %s failed: %s", path, e)
             return {"error": str(e)}
 
+    async def _api_post_for_group(self, group_id: int, path: str, body: Dict[str, Any]) -> Dict[str, Any]:
+        api_key, api_base_url, workspace_id = self._credentials_for_group(group_id)
+        url = f"{api_base_url}{path}"
+        try:
+            resp = await self._http_session.post(
+                url, headers=self._api_headers(api_key, workspace_id), json=body
+            )
+            if resp.status_code >= 400:
+                text = resp.text[:200]
+                logger.warning("SuperAGI API POST %s -> %d: %s", path, resp.status_code, text)
+                return {"error": f"HTTP {resp.status_code}: {text}"}
+            return resp.json()
+        except Exception as e:
+            logger.error("SuperAGI API POST %s failed: %s", path, e)
+            return {"error": str(e)}
+
     # ------------------------------------------------------------------
     # MQTT topic helpers
     # ------------------------------------------------------------------
@@ -215,7 +342,9 @@ class SuperAGIAdapter(BasePlatformAdapter):
         return f"{self._env}/workspace/{self._workspace_id}/user/{self._bot_user_id}/sidebar"
 
     def _group_topic(self, group_id: int) -> str:
-        return f"{self._env}/workspace/{self._workspace_id}/group/{group_id}/messages"
+        sub = self._subscription_map.get(group_id)
+        ws_id = _to_int(sub["workspace_id"]) if sub and "workspace_id" in sub else self._workspace_id
+        return f"{self._env}/workspace/{ws_id}/group/{group_id}/messages"
 
     # ------------------------------------------------------------------
     # Connect / disconnect
@@ -293,6 +422,22 @@ class SuperAGIAdapter(BasePlatformAdapter):
 
         self._mark_connected()
         logger.info("SuperAGI: connected successfully")
+
+        # Subscribe to all pre-configured (workspace, group) topic pairs.
+        # Each subscription uses its own workspace_id so cross-workspace twins
+        # get the right MQTT topic (e.g. workspace/2/group/200/messages).
+        for gid, sub in self._subscription_map.items():
+            if gid not in self._subscribed_groups:
+                ws_id = _to_int(sub.get("workspace_id", self._workspace_id))
+                topic = f"{self._env}/workspace/{ws_id}/group/{gid}/messages"
+                self._mqtt_client.subscribe(topic, qos=1)
+                self._subscribed_groups.add(gid)
+                logger.info("SuperAGI: subscribed to group topic: %s", topic)
+
+        # Start the lightweight admin HTTP server for runtime subscription management
+        # (POST /admin/subscribe-group). Uses aiohttp; runs in the current event loop.
+        asyncio.ensure_future(self._start_admin_server())
+
         return True
 
     @staticmethod
@@ -535,7 +680,11 @@ class SuperAGIAdapter(BasePlatformAdapter):
     async def _fetch_message_content(
         self, group_id: int, message_id: str
     ) -> Optional[Dict[str, Any]]:
-        """Fetch full message content from REST API by ID."""
+        """Fetch full message content from REST API by ID.
+
+        Uses per-group credentials when available so cross-workspace twins
+        fetch messages from the correct workspace's API endpoint.
+        """
         if not message_id:
             return None
 
@@ -544,7 +693,9 @@ class SuperAGIAdapter(BasePlatformAdapter):
             params["group_id"] = group_id
 
         logger.debug("SuperAGI: fetching message content id=%s group=%s", message_id, group_id)
-        result = await self._api_get(f"/v1/messages/{message_id}", params=params or None)
+        result = await self._api_get_for_group(
+            group_id, f"/v1/messages/{message_id}", params=params or None
+        )
         if "error" in result:
             logger.warning(
                 "SuperAGI: failed to fetch message %s: %s", message_id, result["error"]
@@ -637,15 +788,19 @@ class SuperAGIAdapter(BasePlatformAdapter):
     ) -> SendResult:
         """Send a message via the SuperAGI REST API.
 
-        Uses the same payload shape as the working openclaw implementation:
-        ``{"recipient_type": 1, "recipient_id": <int>, "text": <str>}``
+        Uses per-group credentials (api_key, api_base_url, workspace_id) when
+        the group has a subscription entry — enabling cross-workspace twin
+        sharing where each workspace gets its own API key on outbound calls.
+        Falls back to primary credentials for non-twin / single-workspace use.
         """
         if not content or not content.strip():
             return SendResult(success=True)
 
+        group_id = _to_int(chat_id)
+
         body = {
             "recipient_type": 1,
-            "recipient_id": _to_int(chat_id),
+            "recipient_id": group_id,
             "text": content,
             "message_type": "twin_response",
         }
@@ -654,7 +809,7 @@ class SuperAGIAdapter(BasePlatformAdapter):
             "SuperAGI: sending message to chat_id=%s (%d chars)",
             chat_id, len(content),
         )
-        result = await self._api_post("/v1/messages", body)
+        result = await self._api_post_for_group(group_id, "/v1/messages", body)
         if "error" in result:
             logger.error("SuperAGI: send failed to chat_id=%s: %s", chat_id, result["error"])
             is_network = any(
@@ -674,17 +829,157 @@ class SuperAGIAdapter(BasePlatformAdapter):
             # API didn't return message ID — track by content hash as fallback
             self._mark_content_sent(chat_id, content)
         logger.info("SuperAGI: message sent to chat_id=%s msg_id=%s", chat_id, msg_id)
+
+        # Best-effort heartbeat: keep the sandbox alive while messages are flowing
+        asyncio.ensure_future(self._heartbeat_sandbox())
+
         return SendResult(success=True, message_id=str(msg_id) if msg_id else None)
 
     async def send_typing(self, chat_id: str, metadata=None) -> None:
         """Send a typing indicator via the SuperAGI REST API.
 
-        Uses ``{"group_id": <int>}`` matching the working openclaw implementation.
+        Uses per-group credentials so cross-workspace twins post typing events
+        to the correct workspace's API endpoint.
         """
         try:
-            await self._api_post("/v1/realtime/typing", {"group_id": _to_int(chat_id)})
+            group_id = _to_int(chat_id)
+            await self._api_post_for_group(
+                group_id, "/v1/realtime/typing", {"group_id": group_id}
+            )
         except Exception as e:
             logger.debug("SuperAGI: typing indicator failed: %s", e)
+
+    # ------------------------------------------------------------------
+    # Subscription management (runtime + persistence)
+    # ------------------------------------------------------------------
+
+    def _persist_subscriptions(self) -> None:
+        """Write current subscription map to /workspace/.subscribed-groups.json.
+
+        The PVC at /workspace survives pause/resume, so subscriptions added at
+        runtime (via POST /admin/subscribe-group) are available again after the
+        pod is woken up.
+        """
+        try:
+            subs = list(self._subscription_map.values())
+            with open(self._subscriptions_persist_path, "w", encoding="utf-8") as f:
+                json.dump(subs, f, indent=2)
+            logger.debug(
+                "SuperAGI: persisted %d subscriptions to %s",
+                len(subs), self._subscriptions_persist_path,
+            )
+        except Exception as e:
+            logger.warning("SuperAGI: failed to persist subscriptions: %s", e)
+
+    async def _add_subscription(self, sub: Dict[str, Any]) -> None:
+        """Add a subscription at runtime and subscribe to the MQTT topic.
+
+        Called by the admin HTTP server when the claw-service sends a
+        POST /admin/subscribe-group request (e.g. when a twin is added to a
+        shared sandbox at runtime).
+        """
+        group_id = _to_int(sub.get("group_id", 0))
+        if not group_id:
+            logger.warning("SuperAGI: _add_subscription called with invalid group_id")
+            return
+
+        ws_id = _to_int(sub.get("workspace_id", self._workspace_id))
+        self._subscription_map[group_id] = sub
+        self._enabled_groups.add(group_id)
+
+        if self._mqtt_client and group_id not in self._subscribed_groups:
+            topic = f"{self._env}/workspace/{ws_id}/group/{group_id}/messages"
+            self._mqtt_client.subscribe(topic, qos=1)
+            self._subscribed_groups.add(group_id)
+            logger.info("SuperAGI: runtime subscribed to group topic: %s", topic)
+
+        self._persist_subscriptions()
+
+    # ------------------------------------------------------------------
+    # Admin HTTP server (POST /admin/subscribe-group)
+    # ------------------------------------------------------------------
+
+    async def _start_admin_server(self) -> None:
+        """Start a lightweight aiohttp server for admin operations.
+
+        The claw-service calls POST /admin/subscribe-group when a digital twin
+        is assigned to share this sandbox at runtime. The payload is the full
+        GroupSubscription: {workspace_id, group_id, api_key, api_base_url}.
+        """
+        try:
+            from aiohttp import web as _web
+        except ImportError:
+            logger.warning("SuperAGI: aiohttp not installed, admin server disabled (pip install aiohttp)")
+            return
+
+        adapter_ref = self  # capture for closure
+
+        async def handle_subscribe_group(request: Any) -> Any:
+            try:
+                body = await request.json()
+            except Exception:
+                return _web.Response(status=400, text="invalid JSON body")
+
+            group_id = _to_int(body.get("group_id", 0))
+            workspace_id = _to_int(body.get("workspace_id", 0))
+            if not group_id or not workspace_id:
+                return _web.Response(status=400, text="group_id and workspace_id are required")
+
+            sub: Dict[str, Any] = {
+                "workspace_id": workspace_id,
+                "group_id": group_id,
+                "api_key": body.get("api_key", ""),
+                "api_base_url": body.get("api_base_url", "").rstrip("/"),
+            }
+            await adapter_ref._add_subscription(sub)
+            logger.info(
+                "SuperAGI: admin subscribe-group: workspace=%d group=%d",
+                workspace_id, group_id,
+            )
+            return _web.json_response({"status": "ok", "group_id": group_id, "workspace_id": workspace_id})
+
+        async def handle_health(request: Any) -> Any:
+            return _web.json_response({
+                "status": "ok",
+                "subscriptions": len(adapter_ref._subscription_map),
+            })
+
+        app = _web.Application()
+        app.router.add_post("/admin/subscribe-group", handle_subscribe_group)
+        app.router.add_get("/admin/health", handle_health)
+
+        runner = _web.AppRunner(app)
+        await runner.setup()
+        site = _web.TCPSite(runner, "0.0.0.0", self._admin_port)
+        try:
+            await site.start()
+            logger.info("SuperAGI: admin server listening on 0.0.0.0:%d", self._admin_port)
+        except Exception as e:
+            logger.warning("SuperAGI: admin server failed to start on port %d: %s", self._admin_port, e)
+
+    # ------------------------------------------------------------------
+    # Sandbox heartbeat (MQTT wakeup prevention)
+    # ------------------------------------------------------------------
+
+    async def _heartbeat_sandbox(self) -> None:
+        """Notify the sandbox service that this sandbox is actively handling messages.
+
+        Prevents the lifecycle worker from auto-pausing an actively-used sandbox.
+        Best-effort: failures are logged at debug level and never propagated.
+        """
+        if not self._sandbox_id or not self._sandbox_service_url:
+            return
+        try:
+            await self._http_session.post(
+                f"{self._sandbox_service_url}/api/sandboxes/{self._sandbox_id}/heartbeat",
+                timeout=5.0,
+            )
+        except Exception as e:
+            logger.debug("SuperAGI: sandbox heartbeat failed (non-fatal): %s", e)
+
+    # ------------------------------------------------------------------
+    # Image / chat info
+    # ------------------------------------------------------------------
 
     async def send_image(
         self,
