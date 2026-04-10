@@ -10,6 +10,7 @@ import hermes_cli.gateway as gateway
 class TestSystemdLingerStatus:
     def test_reports_enabled(self, monkeypatch):
         monkeypatch.setattr(gateway, "is_linux", lambda: True)
+        monkeypatch.setattr(gateway, "is_termux", lambda: False)
         monkeypatch.setenv("USER", "alice")
         monkeypatch.setattr(
             gateway.subprocess,
@@ -22,6 +23,7 @@ class TestSystemdLingerStatus:
 
     def test_reports_disabled(self, monkeypatch):
         monkeypatch.setattr(gateway, "is_linux", lambda: True)
+        monkeypatch.setattr(gateway, "is_termux", lambda: False)
         monkeypatch.setenv("USER", "alice")
         monkeypatch.setattr(
             gateway.subprocess,
@@ -32,6 +34,11 @@ class TestSystemdLingerStatus:
 
         assert gateway.get_systemd_linger_status() == (False, "")
 
+    def test_reports_termux_as_not_supported(self, monkeypatch):
+        monkeypatch.setattr(gateway, "is_termux", lambda: True)
+
+        assert gateway.get_systemd_linger_status() == (None, "not supported in Termux")
+
 
 def test_systemd_status_warns_when_linger_disabled(monkeypatch, tmp_path, capsys):
     unit_path = tmp_path / "hermes-gateway.service"
@@ -40,7 +47,7 @@ def test_systemd_status_warns_when_linger_disabled(monkeypatch, tmp_path, capsys
     monkeypatch.setattr(gateway, "get_systemd_unit_path", lambda system=False: unit_path)
     monkeypatch.setattr(gateway, "get_systemd_linger_status", lambda: (False, ""))
 
-    def fake_run(cmd, capture_output=False, text=False, check=False):
+    def fake_run(cmd, capture_output=False, text=False, check=False, **kwargs):
         if cmd[:4] == ["systemctl", "--user", "status", gateway.get_service_name()]:
             return SimpleNamespace(returncode=0, stdout="", stderr="")
         if cmd[:3] == ["systemctl", "--user", "is-active"]:
