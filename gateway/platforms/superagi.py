@@ -336,6 +336,11 @@ class SuperAGIAdapter(BasePlatformAdapter):
             topic = self._sidebar_topic()
             logger.info("SuperAGI: MQTT connected (rc=0), subscribing to: %s", topic)
             client.subscribe(topic, qos=1)
+            # Re-subscribe to all group topics that were active before disconnect
+            for group_id in self._subscribed_groups:
+                group_topic = self._group_topic(group_id)
+                client.subscribe(group_topic, qos=1)
+                logger.info("SuperAGI: re-subscribed to group topic after reconnect: %s", group_topic)
         else:
             rc_names = {1: "bad protocol", 2: "client-id rejected", 3: "server unavailable",
                         4: "bad credentials", 5: "not authorized"}
