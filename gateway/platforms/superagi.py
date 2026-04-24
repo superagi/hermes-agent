@@ -84,6 +84,25 @@ def _to_int(val: Any) -> int:
         return 0
 
 
+def _parse_iso_timestamp(val: Any) -> Optional[float]:
+    """Parse an ISO-8601 string or epoch-like value into a Unix timestamp."""
+    if val is None:
+        return None
+    if isinstance(val, (int, float)):
+        return float(val)
+    if not isinstance(val, str) or not val:
+        return None
+    from datetime import datetime, timezone
+    s = val.replace("Z", "+00:00")
+    try:
+        dt = datetime.fromisoformat(s)
+    except ValueError:
+        return None
+    if dt.tzinfo is None:
+        dt = dt.replace(tzinfo=timezone.utc)
+    return dt.timestamp()
+
+
 class SuperAGIAdapter(BasePlatformAdapter):
     """Gateway adapter for SuperAGI messaging (MQTT + REST API)."""
 
@@ -336,6 +355,19 @@ class SuperAGIAdapter(BasePlatformAdapter):
             topic = self._sidebar_topic()
             logger.info("SuperAGI: MQTT connected (rc=0), subscribing to: %s", topic)
             client.subscribe(topic, qos=1)
+            # Re-subscribe to all group topics that were active before disconnect
+            for group_id in self._subscribed_groups:
+                group_topic = self._group_topic(group_id)
+                client.subscribe(group_topic, qos=1)
+                logger.info("SuperAGI: re-subscribed to group topic after reconnect: %s", group_topic)
+            # Backlog replay: messages published with retain=false while the adapter was
+            # not yet subscribed (sandbox still provisioning) are dropped by the broker.
+            # Pull recent messages via REST and dispatch any we haven't already seen.
+            if self._event_loop is not None:
+                asyncio.run_coroutine_threadsafe(
+                    self._replay_backlog(),
+                    self._event_loop,
+                )
         else:
             rc_names = {1: "bad protocol", 2: "client-id rejected", 3: "server unavailable",
                         4: "bad credentials", 5: "not authorized"}
@@ -427,6 +459,13 @@ class SuperAGIAdapter(BasePlatformAdapter):
             logger.warning("SuperAGI: no content for message_id=%s group=%s", message_id, group_id)
             return
 
+        # Twin-mode self-echo: in twin mode the agent posts AS the user
+        # (same user_id) with message_type="twin_response". Those are our own
+        # output coming back via MQTT and must never trigger a new turn.
+        if content.get("message_type") == "twin_response":
+            logger.debug("SuperAGI: skipping twin_response self-echo")
+            return
+
         text = content.get("text", content.get("content", content.get("message", ""))).strip()
         if not text:
             logger.debug("SuperAGI: empty text in message_id=%s, skipping", message_id)
@@ -499,6 +538,11 @@ class SuperAGIAdapter(BasePlatformAdapter):
             logger.warning("SuperAGI: no content for message_id=%s group=%s", message_id, group_id)
             return
 
+        # Twin-mode self-echo: twin_response messages are our own output.
+        if content.get("message_type") == "twin_response":
+            logger.debug("SuperAGI: skipping twin_response self-echo (group=%s)", group_id)
+            return
+
         text = content.get("text", content.get("content", content.get("message", ""))).strip()
         if not text:
             logger.debug("SuperAGI: empty text in message_id=%s, skipping", message_id)
@@ -531,6 +575,96 @@ class SuperAGIAdapter(BasePlatformAdapter):
             message_id=message_id,
         )
         await self.handle_message(event)
+
+    async def _replay_backlog(self) -> None:
+        # Messages published with retain=false while this adapter wasn't yet subscribed
+        # (sandbox provisioning, or brief MQTT drop) are dropped by the broker. Pull
+        # recent messages via REST and dispatch any we haven't already handled.
+        try:
+            window_s = int(os.getenv("SUPERAGI_BACKLOG_REPLAY_WINDOW_SECONDS", "300"))
+        except ValueError:
+            window_s = 300
+        if window_s <= 0:
+            return
+        try:
+            per_group_limit = int(os.getenv("SUPERAGI_BACKLOG_REPLAY_LIMIT", "10"))
+        except ValueError:
+            per_group_limit = 10
+
+        cutoff = time.time() - window_s
+
+        if self._enabled_groups:
+            group_ids = list(self._enabled_groups)
+        else:
+            group_ids = await self._list_user_groups()
+
+        if not group_ids:
+            logger.debug("SuperAGI: backlog replay: no groups to scan")
+            return
+
+        logger.info(
+            "SuperAGI: backlog replay scanning %d group(s) (window=%ds, limit=%d)",
+            len(group_ids), window_s, per_group_limit,
+        )
+
+        for gid in group_ids:
+            try:
+                messages = await self._list_recent_group_messages(gid, per_group_limit)
+            except Exception as e:
+                logger.warning("SuperAGI: backlog replay failed for group=%s: %s", gid, e)
+                continue
+            for msg in messages:
+                sent_at = _parse_iso_timestamp(msg.get("sent_at") or msg.get("created_at"))
+                if sent_at is not None and sent_at < cutoff:
+                    continue
+                # Only replay plain user messages. In twin mode, agent output is
+                # posted AS the user (same user_id) with message_type="twin_response";
+                # replaying those would re-trigger past agent turns on restart.
+                mtype = (msg.get("message_type") or "").lower()
+                if mtype not in ("", "text", "user"):
+                    continue
+                if msg.get("is_system") or msg.get("is_forwarded"):
+                    continue
+                sender_id = _to_int(msg.get("user_id") or msg.get("sender_id") or 0)
+                if sender_id == self._bot_user_id:
+                    continue
+                message_id = str(msg.get("id") or msg.get("message_id") or "")
+                if not message_id or message_id in self._seen_messages:
+                    continue
+                logger.info(
+                    "SuperAGI: backlog replay dispatching message_id=%s group=%s",
+                    message_id, gid,
+                )
+                await self._handle_group_message_event({
+                    "event": "NEW_MESSAGE",
+                    "user_id": sender_id,
+                    "group_id": gid,
+                    "message_id": message_id,
+                })
+
+    async def _list_user_groups(self) -> list[int]:
+        result = await self._api_get("/v1/groups/user/me", params={"limit": 100})
+        if "error" in result:
+            return []
+        groups = result.get("groups", []) or []
+        out: list[int] = []
+        for g in groups:
+            if not isinstance(g, dict):
+                continue
+            gid = _to_int(g.get("id") or g.get("group_id") or 0)
+            if gid:
+                out.append(gid)
+        return out
+
+    async def _list_recent_group_messages(self, group_id: int, limit: int) -> list[dict]:
+        result = await self._api_get(
+            "/v1/messages/group",
+            params={"group_id": group_id, "limit": limit},
+        )
+        if "error" in result:
+            return []
+        msgs = result.get("messages") or result.get("data") or []
+        return [m for m in msgs if isinstance(m, dict)]
 
     async def _fetch_message_content(
         self, group_id: int, message_id: str
