@@ -626,9 +626,15 @@ class SuperAGIAdapter(BasePlatformAdapter):
                 if msg.get("is_system") or msg.get("is_forwarded"):
                     continue
                 sender_id = _to_int(msg.get("user_id") or msg.get("sender_id") or 0)
-                if sender_id == self._bot_user_id:
-                    continue
                 message_id = str(msg.get("id") or msg.get("message_id") or "")
+                # Twin mode: bot posts AS the user (same user_id), so use
+                # message_id-based self-tracking; non-twin uses bot_user_id.
+                if self._enabled_groups:
+                    if self._is_sent_by_self(message_id):
+                        continue
+                else:
+                    if sender_id == self._bot_user_id:
+                        continue
                 if not message_id or message_id in self._seen_messages:
                     continue
                 logger.info(
