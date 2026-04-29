@@ -360,9 +360,7 @@ class SuperAGIAdapter(BasePlatformAdapter):
                 group_topic = self._group_topic(group_id)
                 client.subscribe(group_topic, qos=1)
                 logger.info("SuperAGI: re-subscribed to group topic after reconnect: %s", group_topic)
-            # Backlog replay: messages published with retain=false while the adapter was
-            # not yet subscribed (sandbox still provisioning) are dropped by the broker.
-            # Pull recent messages via REST and dispatch any we haven't already seen.
+            # Backlog replay: pull recent messages via REST to catch retain=false events the broker dropped while we were unsubscribed.
             if self._event_loop is not None:
                 asyncio.run_coroutine_threadsafe(
                     self._replay_backlog(),
@@ -459,9 +457,7 @@ class SuperAGIAdapter(BasePlatformAdapter):
             logger.warning("SuperAGI: no content for message_id=%s group=%s", message_id, group_id)
             return
 
-        # Twin-mode self-echo: in twin mode the agent posts AS the user
-        # (same user_id) with message_type="twin_response". Those are our own
-        # output coming back via MQTT and must never trigger a new turn.
+        # Twin-mode self-echo: agent posts AS the user with message_type="twin_response"; never re-trigger.
         if content.get("message_type") == "twin_response":
             logger.debug("SuperAGI: skipping twin_response self-echo")
             return
@@ -577,9 +573,7 @@ class SuperAGIAdapter(BasePlatformAdapter):
         await self.handle_message(event)
 
     async def _replay_backlog(self) -> None:
-        # Messages published with retain=false while this adapter wasn't yet subscribed
-        # (sandbox provisioning, or brief MQTT drop) are dropped by the broker. Pull
-        # recent messages via REST and dispatch any we haven't already handled.
+        # Pull recent messages via REST to recover retain=false events the broker dropped while we were unsubscribed.
         try:
             window_s = int(os.getenv("SUPERAGI_BACKLOG_REPLAY_WINDOW_SECONDS", "300"))
         except ValueError:
@@ -617,9 +611,7 @@ class SuperAGIAdapter(BasePlatformAdapter):
                 sent_at = _parse_iso_timestamp(msg.get("sent_at") or msg.get("created_at"))
                 if sent_at is not None and sent_at < cutoff:
                     continue
-                # Only replay plain user messages. In twin mode, agent output is
-                # posted AS the user (same user_id) with message_type="twin_response";
-                # replaying those would re-trigger past agent turns on restart.
+                # Only replay plain user messages — twin_response is our own agent output.
                 mtype = (msg.get("message_type") or "").lower()
                 if mtype not in ("", "text", "user"):
                     continue
@@ -627,8 +619,7 @@ class SuperAGIAdapter(BasePlatformAdapter):
                     continue
                 sender_id = _to_int(msg.get("user_id") or msg.get("sender_id") or 0)
                 message_id = str(msg.get("id") or msg.get("message_id") or "")
-                # Twin mode: bot posts AS the user (same user_id), so use
-                # message_id-based self-tracking; non-twin uses bot_user_id.
+                # Twin mode: bot posts AS the user — track by message_id; non-twin tracks by bot_user_id.
                 if self._enabled_groups:
                     if self._is_sent_by_self(message_id):
                         continue

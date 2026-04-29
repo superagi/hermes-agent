@@ -32,6 +32,30 @@ def _install_telegram_mock(monkeypatch, bot):
     monkeypatch.setitem(sys.modules, "telegram.constants", constants_mod)
 
 
+def _ensure_slack_mock(monkeypatch):
+    if "slack_bolt" in sys.modules and hasattr(sys.modules["slack_bolt"], "__file__"):
+        return
+
+    slack_bolt = MagicMock()
+    slack_bolt.async_app.AsyncApp = MagicMock
+    slack_bolt.adapter.socket_mode.async_handler.AsyncSocketModeHandler = MagicMock
+
+    slack_sdk = MagicMock()
+    slack_sdk.web.async_client.AsyncWebClient = MagicMock
+
+    for name, mod in [
+        ("slack_bolt", slack_bolt),
+        ("slack_bolt.async_app", slack_bolt.async_app),
+        ("slack_bolt.adapter", slack_bolt.adapter),
+        ("slack_bolt.adapter.socket_mode", slack_bolt.adapter.socket_mode),
+        ("slack_bolt.adapter.socket_mode.async_handler", slack_bolt.adapter.socket_mode.async_handler),
+        ("slack_sdk", slack_sdk),
+        ("slack_sdk.web", slack_sdk.web),
+        ("slack_sdk.web.async_client", slack_sdk.web.async_client),
+    ]:
+        monkeypatch.setitem(sys.modules, name, mod)
+
+
 class TestSendMessageTool:
     def test_cron_duplicate_target_is_skipped_and_explained(self):
         home = SimpleNamespace(chat_id="-1001")
@@ -203,6 +227,44 @@ class TestSendMessageTool:
             media_files=[],
         )
 
+    def test_display_label_target_resolves_via_channel_directory(self, tmp_path):
+        config, telegram_cfg = _make_config()
+        cache_file = tmp_path / "channel_directory.json"
+        cache_file.write_text(json.dumps({
+            "updated_at": "2026-01-01T00:00:00",
+            "platforms": {
+                "telegram": [
+                    {"id": "-1001:17585", "name": "Coaching Chat / topic 17585", "type": "group"}
+                ]
+            },
+        }))
+
+        with patch("gateway.channel_directory.DIRECTORY_PATH", cache_file), \
+             patch("gateway.config.load_gateway_config", return_value=config), \
+             patch("tools.interrupt.is_interrupted", return_value=False), \
+             patch("model_tools._run_async", side_effect=_run_async_immediately), \
+             patch("tools.send_message_tool._send_to_platform", new=AsyncMock(return_value={"success": True})) as send_mock, \
+             patch("gateway.mirror.mirror_to_session", return_value=True):
+            result = json.loads(
+                send_message_tool(
+                    {
+                        "action": "send",
+                        "target": "telegram:Coaching Chat / topic 17585 (group)",
+                        "message": "hello",
+                    }
+                )
+            )
+
+        assert result["success"] is True
+        send_mock.assert_awaited_once_with(
+            Platform.TELEGRAM,
+            telegram_cfg,
+            "-1001",
+            "hello",
+            thread_id="17585",
+            media_files=[],
+        )
+
     def test_media_only_message_uses_placeholder_for_mirroring(self):
         config, telegram_cfg = _make_config()
 
@@ -237,6 +299,33 @@ class TestSendMessageTool:
             source_label="cli",
             thread_id=None,
         )
+
+    def test_top_level_send_failure_redacts_query_token(self):
+        config, _telegram_cfg = _make_config()
+        leaked = "very-secret-query-token-123456"
+
+        def _raise_and_close(coro):
+            coro.close()
+            raise RuntimeError(
+                f"transport error: https://api.example.com/send?access_token={leaked}"
+            )
+
+        with patch("gateway.config.load_gateway_config", return_value=config), \
+             patch("tools.interrupt.is_interrupted", return_value=False), \
+             patch("model_tools._run_async", side_effect=_raise_and_close):
+            result = json.loads(
+                send_message_tool(
+                    {
+                        "action": "send",
+                        "target": "telegram:-1001",
+                        "message": "hello",
+                    }
+                )
+            )
+
+        assert "error" in result
+        assert leaked not in result["error"]
+        assert "access_token=***" in result["error"]
 
 
 class TestSendTelegramMediaDelivery:
@@ -361,7 +450,7 @@ class TestSendToPlatformChunking:
             result = asyncio.run(
                 _send_to_platform(
                     Platform.DISCORD,
-                    SimpleNamespace(enabled=True, token="tok", extra={}),
+                    SimpleNamespace(enabled=True, token="***", extra={}),
                     "ch", long_msg,
                 )
             )
@@ -370,8 +459,115 @@ class TestSendToPlatformChunking:
         for call in send.await_args_list:
             assert len(call.args[2]) <= 2020  # each chunk fits the limit
 
+    def test_slack_messages_are_formatted_before_send(self, monkeypatch):
+        _ensure_slack_mock(monkeypatch)
+
+        import gateway.platforms.slack as slack_mod
+
+        monkeypatch.setattr(slack_mod, "SLACK_AVAILABLE", True)
+        send = AsyncMock(return_value={"success": True, "message_id": "1"})
+
+        with patch("tools.send_message_tool._send_slack", send):
+            result = asyncio.run(
+                _send_to_platform(
+                    Platform.SLACK,
+                    SimpleNamespace(enabled=True, token="***", extra={}),
+                    "C123",
+                    "**hello** from [Hermes](<https://example.com>)",
+                )
+            )
+
+        assert result["success"] is True
+        send.assert_awaited_once_with(
+            "***",
+            "C123",
+            "*hello* from <https://example.com|Hermes>",
+        )
+
+    def test_slack_bold_italic_formatted_before_send(self, monkeypatch):
+        """Bold+italic ***text*** survives tool-layer formatting."""
+        _ensure_slack_mock(monkeypatch)
+        import gateway.platforms.slack as slack_mod
+
+        monkeypatch.setattr(slack_mod, "SLACK_AVAILABLE", True)
+        send = AsyncMock(return_value={"success": True, "message_id": "1"})
+        with patch("tools.send_message_tool._send_slack", send):
+            result = asyncio.run(
+                _send_to_platform(
+                    Platform.SLACK,
+                    SimpleNamespace(enabled=True, token="***", extra={}),
+                    "C123",
+                    "***important*** update",
+                )
+            )
+        assert result["success"] is True
+        sent_text = send.await_args.args[2]
+        assert "*_important_*" in sent_text
+
+    def test_slack_blockquote_formatted_before_send(self, monkeypatch):
+        """Blockquote '>' markers must survive formatting (not escaped to '&gt;')."""
+        _ensure_slack_mock(monkeypatch)
+        import gateway.platforms.slack as slack_mod
+
+        monkeypatch.setattr(slack_mod, "SLACK_AVAILABLE", True)
+        send = AsyncMock(return_value={"success": True, "message_id": "1"})
+        with patch("tools.send_message_tool._send_slack", send):
+            result = asyncio.run(
+                _send_to_platform(
+                    Platform.SLACK,
+                    SimpleNamespace(enabled=True, token="***", extra={}),
+                    "C123",
+                    "> important quote\n\nnormal text & stuff",
+                )
+            )
+        assert result["success"] is True
+        sent_text = send.await_args.args[2]
+        assert sent_text.startswith("> important quote")
+        assert "&amp;" in sent_text  # & is escaped
+        assert "&gt;" not in sent_text.split("\n")[0]  # > in blockquote is NOT escaped
+
+    def test_slack_pre_escaped_entities_not_double_escaped(self, monkeypatch):
+        """Pre-escaped HTML entities survive tool-layer formatting without double-escaping."""
+        _ensure_slack_mock(monkeypatch)
+        import gateway.platforms.slack as slack_mod
+        monkeypatch.setattr(slack_mod, "SLACK_AVAILABLE", True)
+        send = AsyncMock(return_value={"success": True, "message_id": "1"})
+        with patch("tools.send_message_tool._send_slack", send):
+            result = asyncio.run(
+                _send_to_platform(
+                    Platform.SLACK,
+                    SimpleNamespace(enabled=True, token="***", extra={}),
+                    "C123",
+                    "AT&amp;T &lt;tag&gt; test",
+                )
+            )
+        assert result["success"] is True
+        sent_text = send.await_args.args[2]
+        assert "&amp;amp;" not in sent_text
+        assert "&amp;lt;" not in sent_text
+        assert "AT&amp;T" in sent_text
+
+    def test_slack_url_with_parens_formatted_before_send(self, monkeypatch):
+        """Wikipedia-style URL with parens survives tool-layer formatting."""
+        _ensure_slack_mock(monkeypatch)
+        import gateway.platforms.slack as slack_mod
+        monkeypatch.setattr(slack_mod, "SLACK_AVAILABLE", True)
+        send = AsyncMock(return_value={"success": True, "message_id": "1"})
+        with patch("tools.send_message_tool._send_slack", send):
+            result = asyncio.run(
+                _send_to_platform(
+                    Platform.SLACK,
+                    SimpleNamespace(enabled=True, token="***", extra={}),
+                    "C123",
+                    "See [Foo](https://en.wikipedia.org/wiki/Foo_(bar))",
+                )
+            )
+        assert result["success"] is True
+        sent_text = send.await_args.args[2]
+        assert "<https://en.wikipedia.org/wiki/Foo_(bar)|Foo>" in sent_text
+
     def test_telegram_media_attaches_to_last_chunk(self):
-        """When chunked, media files are sent only with the last chunk."""
+
         sent_calls = []
 
         async def fake_send(token, chat_id, message, media_files=None, thread_id=None):
